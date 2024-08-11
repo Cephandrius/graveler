@@ -11,8 +11,8 @@ def main():
     while ones < 177 and rolls < 10000:
         ones = 0
         for i in range(231):
-            roll = random.randint(0,3)
-            if roll == 0:
+            roll = random.random()
+            if roll <= 0.25:
                   ones += 1
         rolls = rolls + 1
         if ones > maxOnes:
