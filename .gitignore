@@ -1,2 +1,4 @@
 *.swp
 src/python/.venv/*
+src/python/profile_results*
+src/python/profile_output*
