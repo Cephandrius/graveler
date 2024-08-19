@@ -8,7 +8,7 @@ def main():
     maxOnes = 0
     ones = 0
     
-    while ones < 177 and rolls < 10000:
+    while ones < 177 and rolls < 1000000:
         ones = 0
         for i in range(231):
             roll = random.random()
