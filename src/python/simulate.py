@@ -1,8 +1,6 @@
 import random
 import math
-from line_profiler import profile
 
-@profile
 def main():
     rolls = 0
     maxOnes = 0

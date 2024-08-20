@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.1)
 
-project(AustinsChallenge LANGUAGES C)
+project(graveler LANGUAGES C)
 
 find_package(OpenCL REQUIRED)
 

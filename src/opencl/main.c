@@ -8,12 +8,12 @@
 #include <stdlib.h>
 
 cl_int initialize_kernel(cl_device_id device, cl_context *context, cl_program *program, cl_kernel *kernel);
-cl_int make_buffers(cl_context context, size_t num_seeds, size_t sims_per_seed, cl_mem *seeds, cl_mem *res);
-cl_int do_one_iteration(cl_command_queue queue, cl_kernel kernel, cl_mem seeds, cl_mem res, uint64_t *host_seeds, uint16_t *host_res, size_t num_seeds, size_t sims_per_seed, size_t work_group_size, cl_event *read_res, int *most_successes, bool first_execute, bool last_execute);
+cl_int make_buffers(cl_context context, size_t num_seeds, cl_mem *seeds, cl_mem *res);
+cl_int do_one_iteration(cl_command_queue queue, cl_kernel kernel, cl_mem seeds, cl_mem res, uint64_t *host_seeds, uint16_t *host_res, size_t num_seeds, size_t *sims_per_seed, size_t work_group_size, cl_event *read_res, cl_event *execute_kernel, int *most_successes, bool first_execute, bool last_execute, size_t param_max_size, void* param);
+cl_int set_kernel_num_sims(cl_kernel kernel, uint64_t num_sims);
 cl_int set_kernel_args(cl_kernel kernel, uint64_t num_sims, cl_mem seeds, cl_mem res);
-cl_int calc_res_size(cl_device_id device, long number_sims, size_t *work_group_size, size_t *num_seeds, size_t *sims_per_seed, size_t *num_repetitions);
-cl_int get_device_info(cl_device_id device, size_t *max_variable_size, size_t *max_global_memory, size_t *max_work_group_size, cl_uint *num_compute_units);
-int test_res_size(size_t num_seeds, size_t sims_per_seed, size_t max_memory, size_t max_variable_size);
+cl_int calc_res_size(cl_device_id device, size_t *work_group_size, size_t *num_seeds);
+cl_int get_device_info(cl_device_id device, size_t *max_work_group_size, cl_uint *num_compute_units);
 cl_int get_platform(cl_platform_id* platform, bool is_my_computer);
 void print_cl_error(char* function_name, cl_int err, int line_num);
 cl_int get_device(cl_platform_id platform, cl_device_id* device, bool is_my_computer);
@@ -24,14 +24,20 @@ const char *program_text[] = {
 "#include <tyche_i.cl>\n\
 kernel void simulate(ulong num_sims, global ulong* seed, global ushort* res){\n\
 	uint gid = get_global_id(0);\n\
+	uint current_successes;\n\
+	uint most_successes = 0;\n\
 	tyche_i_state state;\n\
 	tyche_i_seed(&state, seed[gid]);\n\
 	for(ulong i = 0; i < num_sims; i++){\n\
-		res[gid * num_sims + i] = 0;\n\
+		current_successes = 0;\n\
 		for(int j = 0; j < 231; j++){\n\
-			res[gid * num_sims + i] += tyche_i_uint(state) % 4 == 0;\n\
+			current_successes += tyche_i_uint(state) % 4 == 0;\n\
+		}\n\
+		if(most_successes < current_successes){\n\
+			most_successes = current_successes;\n\
 		}\n\
 	}\n\
+	res[gid] = most_successes;\n\
 }\n"
 };
 
@@ -54,7 +60,7 @@ kernel void simulate(ulong num_sims, global ulong* seed, global ushort* res){\n\
 
 int main(int argc, char ** argv){
 	size_t param_max_size;
-	void* param ;
+	void* param;
 	size_t param_size;
 	cl_int CL_err;
 	cl_platform_id platform;
@@ -66,15 +72,15 @@ int main(int argc, char ** argv){
 	cl_mem res;
 	cl_command_queue queue;
 	cl_event read_res;
+	cl_event execute_kernel;
 	long num_simulations;
 	size_t num_seeds;
 	size_t sims_per_seed;
-	size_t num_repetitions;
 	size_t work_group_size;
 	uint64_t *host_seeds;
 	uint16_t *host_res;
 	int most_successes = 0;
-	long completed_simulations = 0;
+	long queued_simulations = 0;
 	bool my_computer;
 	int num_simulations_arg;
 	int my_computer_arg;
@@ -126,19 +132,18 @@ int main(int argc, char ** argv){
 	}
 	printf("Kernel initalized.\n");
 
-	CL_err = calc_res_size(device, num_simulations, &work_group_size, &num_seeds, &sims_per_seed, &num_repetitions);
+	CL_err = calc_res_size(device, &work_group_size, &num_seeds);
 	if(CL_err != CL_SUCCESS){
 		return CL_err;
 	}	
-	printf("Calculated result size.\n");
 
-	CL_err = make_buffers(context, num_seeds, sims_per_seed, &seeds, &res);
+	CL_err = make_buffers(context, num_seeds, &seeds, &res);
 	if(CL_err != CL_SUCCESS){
 		return CL_err;
 	}
 	printf("Made buffers.\n");
 	host_seeds = malloc(sizeof(uint64_t) * num_seeds);
-	host_res = malloc(sizeof(uint16_t) * num_seeds * sims_per_seed);
+	host_res = malloc(sizeof(uint16_t) * num_seeds);
 
 	cl_queue_properties properties[] = {CL_QUEUE_PROPERTIES, CL_QUEUE_PROFILING_ENABLE, 0};
 	queue = clCreateCommandQueueWithProperties(context, device,properties , &CL_err);
@@ -147,7 +152,8 @@ int main(int argc, char ** argv){
 		return CL_err;
 	}
 	printf("Made command queue.\n");
-
+	
+	sims_per_seed = 1000;
 	CL_err = set_kernel_args(kernel, (uint64_t) sims_per_seed, seeds, res);
 	if(CL_err != CL_SUCCESS){
 		return CL_err;
@@ -156,20 +162,31 @@ int main(int argc, char ** argv){
 	srand(time(NULL));
 
 	printf("Starting Computation.\n");	
-	do_one_iteration(queue, kernel, seeds, res, host_seeds, host_res, num_seeds, sims_per_seed, work_group_size, &read_res, &most_successes, true, false); 
-	for(int i = 0; i < num_repetitions; i++){
-		if(i == num_repetitions - 1){
-			do_one_iteration(queue, kernel, seeds, res, host_seeds, host_res, num_seeds, sims_per_seed, work_group_size, &read_res, &most_successes, false, true); 
+	param_max_size = 1024;
+	param = malloc(param_max_size);
+	CL_err = do_one_iteration(queue, kernel, seeds, res, host_seeds, host_res, num_seeds, &sims_per_seed, work_group_size, &read_res, &execute_kernel, &most_successes, true, false, param_max_size, param); 
+	if(CL_err != CL_SUCCESS){
+		return CL_err;
+	}
+	for(queued_simulations = num_seeds * sims_per_seed; queued_simulations < num_simulations; queued_simulations += num_seeds * sims_per_seed){
+		if(queued_simulations >= num_simulations){
+			CL_err = do_one_iteration(queue, kernel, seeds, res, host_seeds, host_res, num_seeds, &sims_per_seed, work_group_size, &read_res, &execute_kernel, &most_successes, false, true, param_max_size, param); 
+			if(CL_err != CL_SUCCESS){
+				return CL_err;
+			}
 		}else{
-			do_one_iteration(queue, kernel, seeds, res, host_seeds, host_res, num_seeds, sims_per_seed, work_group_size, &read_res, &most_successes, false, false); 
-			completed_simulations += num_seeds * sims_per_seed;
-			printf("Progress: %li simulations\n", completed_simulations);
+			CL_err = do_one_iteration(queue, kernel, seeds, res, host_seeds, host_res, num_seeds, &sims_per_seed, work_group_size, &read_res, &execute_kernel,  &most_successes, false, false, param_max_size, param); 
+			if(CL_err != CL_SUCCESS){
+				return CL_err;
+			}
+			printf("Progress: %li simulations\n", queued_simulations);
 		}
 	}
 
-	printf("Num Simulations:%li\nMost Successes:%i\n", num_seeds * sims_per_seed * num_repetitions, most_successes);
+	printf("Num Simulations:%li\nMost Successes:%i\n", queued_simulations, most_successes);
 	free(host_seeds);
 	free(host_res);
+	free(param);
 #ifdef __linux__
 	clock_gettime(CLOCK_MONOTONIC, &end);
 	printf("Time Taken:%f seconds\n", (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1000000000.0);
@@ -177,14 +194,32 @@ int main(int argc, char ** argv){
 	return 0;
 }
 
-cl_int do_one_iteration(cl_command_queue queue, cl_kernel kernel, cl_mem seeds, cl_mem res, uint64_t *host_seeds, uint16_t *host_res, size_t num_seeds, size_t sims_per_seed, size_t work_group_size, cl_event *read_res, int *most_successes, bool first_execute, bool last_execute){
+cl_int do_one_iteration(cl_command_queue queue, cl_kernel kernel, cl_mem seeds, cl_mem res, uint64_t *host_seeds, uint16_t *host_res, size_t num_seeds, size_t *sims_per_seed, size_t work_group_size, cl_event *read_res, cl_event *execute_kernel, int *most_successes, bool first_execute, bool last_execute, size_t param_max_size, void* param){
 	cl_int CL_err;
 	cl_event write_seeds;
-	cl_event execute_kernel;
+	cl_ulong start;
+	cl_ulong end;
 	if(!first_execute){
 		CL_err = clWaitForEvents(1, read_res);
 		if(CL_err != CL_SUCCESS){
 			print_cl_error("clWaitForEvents", CL_err, __LINE__);
+			return CL_err;
+		}
+		CL_err = clGetEventProfilingInfo(*execute_kernel, CL_PROFILING_COMMAND_START, param_max_size, param, NULL);
+		if(CL_err != CL_SUCCESS){
+			print_cl_error("clGetEventProfilingInfo", CL_err, __LINE__);
+			return CL_err;
+		}
+		start = *((cl_ulong *) param);
+		CL_err = clGetEventProfilingInfo(*execute_kernel, CL_PROFILING_COMMAND_END, param_max_size, param, NULL);
+		if(CL_err != CL_SUCCESS){
+			print_cl_error("clGetEventProfilingInfo", CL_err, __LINE__);
+			return CL_err;
+		}
+		end = *((cl_ulong *) param);
+		*sims_per_seed = *sims_per_seed * 1000000000.0 / (end - start);
+		CL_err = set_kernel_num_sims(kernel, *sims_per_seed);
+		if(CL_err != CL_SUCCESS){
 			return CL_err;
 		}
 	}
@@ -195,7 +230,7 @@ cl_int do_one_iteration(cl_command_queue queue, cl_kernel kernel, cl_mem seeds, 
 			print_cl_error("clEnqueueWriteBuffer", CL_err, __LINE__);
 			return CL_err;
 		}
-		CL_err = clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &num_seeds, &work_group_size, 1, &write_seeds, &execute_kernel);
+		CL_err = clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &num_seeds, &work_group_size, 1, &write_seeds, execute_kernel);
 		if(CL_err != CL_SUCCESS){
 			print_cl_error("clEnqueueNDRangeKernel", CL_err, __LINE__);
 			return CL_err;
@@ -203,7 +238,7 @@ cl_int do_one_iteration(cl_command_queue queue, cl_kernel kernel, cl_mem seeds, 
 	}
 
 	if(!first_execute){
-		for(size_t i = 0; i < num_seeds * sims_per_seed; i++){
+		for(size_t i = 0; i < num_seeds; i++){
 			if(*most_successes < host_res[i]){
 				*most_successes = host_res[i];
 			}
@@ -211,7 +246,7 @@ cl_int do_one_iteration(cl_command_queue queue, cl_kernel kernel, cl_mem seeds, 
 	}
 
 	if(!last_execute){
-		CL_err = clEnqueueReadBuffer(queue, res, CL_FALSE, 0, sizeof(uint16_t) * num_seeds * sims_per_seed, host_res, 1, &execute_kernel, read_res);
+		CL_err = clEnqueueReadBuffer(queue, res, CL_FALSE, 0, sizeof(uint16_t) * num_seeds, host_res, 1, execute_kernel, read_res);
 		if(CL_err != CL_SUCCESS){
 			print_cl_error("clEnqueueReadBuffer", CL_err, __LINE__);
 			return CL_err;
@@ -220,10 +255,18 @@ cl_int do_one_iteration(cl_command_queue queue, cl_kernel kernel, cl_mem seeds, 
 	return CL_SUCCESS;
 }
 
-cl_int set_kernel_args(cl_kernel kernel, uint64_t num_sims, cl_mem seeds, cl_mem res){
+cl_int set_kernel_num_sims(cl_kernel kernel, uint64_t num_sims){
 	cl_int CL_err = clSetKernelArg(kernel, 0, sizeof(uint64_t), &num_sims);
 	if(CL_err != CL_SUCCESS){
 		print_cl_error("clSetKernelArg", CL_err, __LINE__);
+		return CL_err;
+	}
+	return CL_SUCCESS;
+}
+
+cl_int set_kernel_args(cl_kernel kernel, uint64_t num_sims, cl_mem seeds, cl_mem res){
+	cl_int CL_err = set_kernel_num_sims(kernel, num_sims);
+	if(CL_err != CL_SUCCESS){
 		return CL_err;
 	}
 	CL_err = clSetKernelArg(kernel, 1, sizeof(cl_mem), &seeds);
@@ -239,14 +282,14 @@ cl_int set_kernel_args(cl_kernel kernel, uint64_t num_sims, cl_mem seeds, cl_mem
 	return CL_SUCCESS;
 }
 
-cl_int make_buffers(cl_context context, size_t num_seeds, size_t sims_per_seed, cl_mem *seeds, cl_mem *res){
+cl_int make_buffers(cl_context context, size_t num_seeds, cl_mem *seeds, cl_mem *res){
 	cl_int CL_err;
 	*seeds = clCreateBuffer(context, CL_MEM_READ_ONLY, sizeof(uint64_t) * num_seeds, NULL, &CL_err);
 	if(CL_err != CL_SUCCESS){
 		print_cl_error("clCreateBuffer", CL_err, __LINE__);
 		return CL_err;
 	}
-	*res = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(uint16_t) * num_seeds * sims_per_seed, NULL, &CL_err);
+	*res = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(uint16_t) * num_seeds , NULL, &CL_err);
 	if(CL_err != CL_SUCCESS){
 		print_cl_error("clCreateBuffer", CL_err, __LINE__);
 		return CL_err;
@@ -254,95 +297,31 @@ cl_int make_buffers(cl_context context, size_t num_seeds, size_t sims_per_seed, 
 	return CL_SUCCESS;
 }
 
-cl_int calc_res_size(cl_device_id device, long number_sims, size_t *work_group_size, size_t *num_seeds, size_t *sims_per_seed, size_t *num_repetitions){
+cl_int calc_res_size(cl_device_id device, size_t *work_group_size, size_t *num_seeds){
 	cl_int CL_err;
-	size_t max_variable_size;
-	size_t max_global_memory;
 	size_t max_work_group_size;
 	cl_uint num_compute_units;
-	size_t max_memory;
-	size_t memory_needed;
-	size_t memory_per_repetition;
-	int size_ok;
-	int attempts_to_find_size = 0;
 
-	CL_err = get_device_info(device, &max_variable_size, &max_global_memory, &max_work_group_size, &num_compute_units);
+	CL_err = get_device_info(device, &max_work_group_size, &num_compute_units);
 	if(CL_err != CL_SUCCESS){
 		return CL_err;
 	}
 
-	max_memory = max_global_memory > MAX_MEMORY_USAGE ? MAX_MEMORY_USAGE : max_global_memory;
-	memory_needed = round(number_sims * 2.1); //The 0.1 represents memory used by seeds
-	*num_repetitions = ceil(memory_needed / (double) max_memory);
-	memory_per_repetition = ceil(memory_needed / (double) *num_repetitions);
 	*num_seeds = num_compute_units * max_work_group_size;
-	*sims_per_seed = floor((memory_per_repetition - (8 * *num_seeds)) / 2.0 / *num_seeds);
-	do{
-		attempts_to_find_size += 1;
-		if(attempts_to_find_size > 1000){
-			printf("Having difficulty finding best size for results.\nnum_seeds:%li\nsims_per_seed:%li\n",*num_seeds, *sims_per_seed);
-			return -1;
-		}
-		size_ok = test_res_size(*num_seeds, *sims_per_seed, max_memory, max_variable_size);
-		if(size_ok != SIMS_TOO_BIG){
-			*sims_per_seed -= 1;
-		}else if(size_ok == TOO_MUCH_MEMORY){
-			*num_seeds -= num_compute_units;
-		}
-	} while(size_ok != OK && *sims_per_seed != 0 && *num_seeds != 0);
-
-	if(*sims_per_seed == 0 || *num_seeds == 0){
-		printf("Your devices specs are too weird for me to work with.\n Compute Units:%i\n Max Work Group Size:%li\n Max Global Memory:%li bytes\n", num_compute_units, max_work_group_size, max_global_memory);
-		return TOO_WEIRD;
-	}
-	*work_group_size = *num_seeds / num_compute_units;	
+	*work_group_size = max_work_group_size;
 	return CL_SUCCESS;
 }
 
-cl_int get_device_info(cl_device_id device, size_t *max_variable_size, size_t *max_global_memory, size_t *max_work_group_size, cl_uint *num_compute_units){
+cl_int get_device_info(cl_device_id device, size_t *max_work_group_size, cl_uint *num_compute_units){
 	cl_int CL_err;
 	size_t param_max_size;
 	void* param;
 	size_t param_size;
 	char major_version;
-	bool supports_v2;
 
 	param_max_size = 128;
 	param = malloc(param_max_size);
 
-	CL_err = clGetDeviceInfo(device, CL_DEVICE_VERSION, param_max_size, param, &param_size);
-	if(CL_err != CL_SUCCESS){
-		print_cl_error("clGetDeviceInfo", CL_err, __LINE__);
-		free(param);
-		return CL_err;
-	}
-	major_version = ((char *) param)[7];
-	if(major_version == '2' || major_version == '3'){
-		supports_v2 = true;
-	}else{
-		supports_v2 = false;
-	}
-
-	if(supports_v2){
-		CL_err = clGetDeviceInfo(device, CL_DEVICE_MAX_GLOBAL_VARIABLE_SIZE, param_max_size, param, &param_size);
-		if(CL_err != CL_SUCCESS){
-			print_cl_error("clGetDeviceInfo", CL_err, __LINE__);
-			free(param);
-			return CL_err;
-		}
-		*max_variable_size = *(size_t*) param;
-	
-		CL_err = clGetDeviceInfo(device, CL_DEVICE_GLOBAL_VARIABLE_PREFERRED_TOTAL_SIZE, param_max_size, param, &param_size);
-		if(CL_err != CL_SUCCESS){
-			print_cl_error("clGetDeviceInfo", CL_err, __LINE__);
-			free(param);
-			return CL_err;
-		}
-		*max_global_memory = *(size_t*) param;
-	}else{
-		*max_global_memory = 1024 * 1024 * 1024;
-		*max_variable_size = 1024 * 1024 * 1024;
-	}
 	CL_err = clGetDeviceInfo(device, CL_DEVICE_MAX_WORK_GROUP_SIZE, param_max_size, param, &param_size);
 	if(CL_err != CL_SUCCESS){
 		print_cl_error("clGetDeviceInfo", CL_err, __LINE__);
@@ -360,17 +339,6 @@ cl_int get_device_info(cl_device_id device, size_t *max_variable_size, size_t *m
 	*num_compute_units = *(cl_uint*) param;
 	free(param);
 	return CL_SUCCESS;
-}
-int test_res_size(size_t num_seeds, size_t sims_per_seed, size_t max_memory, size_t max_variable_size){
-	size_t sims_size = num_seeds * sims_per_seed * 2;  
-	size_t memory_used = num_seeds * 8 + sims_size;
-	if(memory_used > max_memory){
-		return TOO_MUCH_MEMORY;
-	}
-	if(sims_size > max_variable_size){
-		return SIMS_TOO_BIG;
-	}
-	return OK;
 }
 
 cl_int initialize_kernel(cl_device_id device, cl_context *context, cl_program *program, cl_kernel *kernel){
