@@ -7,9 +7,9 @@ OpenCL is a library for running programs in parallel, meaning that you can run m
 [This](https://github.com/KhronosGroup/OpenCL-Guide) is a github to get you introduced to OpenCL. It has a couple of pages for getting OpenCL installed.
 
 If you got it installed okay, then you can download my code from github. Navigate to src\opencl\ and run
-'''
+```
 cmake -S . -B build\
 cmake --build .\build
 .\build\graveler 1000000000
-'''
+```
 There might be some things that go wrong and I would love to help you out. Reach out to me a paulchristopherschuckjr@gmail.com .
