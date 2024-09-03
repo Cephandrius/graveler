@@ -1,29 +1,16 @@
-#define _XOPEN_SOURCE 700
-#include <math.h>
-#include <stdbool.h>
-#include <stdio.h>
-#include <CL/cl.h>
-#include <string.h>
-#include <time.h>
-#include <stdlib.h>
-
-cl_int initialize_kernel(cl_device_id device, cl_context *context, cl_program *program, cl_kernel *kernel);
-cl_int make_buffers(cl_context context, size_t num_seeds, cl_mem *seeds, cl_mem *res);
-cl_int do_one_iteration(cl_command_queue queue, cl_kernel kernel, cl_mem seeds, cl_mem res, uint64_t *host_seeds, uint16_t *host_res, size_t num_seeds, size_t *sims_per_seed, size_t work_group_size, cl_event *read_res, cl_event *execute_kernel, int *most_successes, bool first_execute, bool last_execute, size_t param_max_size, void* param);
-cl_int set_kernel_num_sims(cl_kernel kernel, uint64_t num_sims);
-cl_int set_kernel_args(cl_kernel kernel, uint64_t num_sims, cl_mem seeds, cl_mem res);
-cl_int calc_res_size(cl_device_id device, size_t *work_group_size, size_t *num_seeds);
-cl_int get_device_info(cl_device_id device, size_t *max_work_group_size, cl_uint *num_compute_units);
-cl_int get_platform(cl_platform_id* platform, bool is_my_computer);
-void print_cl_error(char* function_name, cl_int err, int line_num);
-cl_int get_device(cl_platform_id platform, cl_device_id* device, bool is_my_computer);
-void create_seeds(uint64_t* host_seeds, size_t num_seeds);
-void print_help(char* program_name);
+#include "main.h"
 
 const char *program_text[] = {
 "#include <tyche_i.cl>\n\
+#define EVEN_BITS 0xaaaaaaaaaaaaaaaa\n\
+#define SIMS_PER_LONG 32\n\
+#define FIRST_SIM 1\n\
+bool roll(int *num_sims_left, ulong *sims, tyche_i_state *state);\n\
+ulong make_more_sims(tyche_i_state *state);\n\
 kernel void simulate(ulong num_sims, global ulong* seed, global ushort* res){\n\
 	uint gid = get_global_id(0);\n\
+	int num_sims_left = 0;\n\
+	ulong sims = 0;\n\
 	uint current_successes;\n\
 	uint most_successes = 0;\n\
 	tyche_i_state state;\n\
@@ -31,32 +18,34 @@ kernel void simulate(ulong num_sims, global ulong* seed, global ushort* res){\n\
 	for(ulong i = 0; i < num_sims; i++){\n\
 		current_successes = 0;\n\
 		for(int j = 0; j < 231; j++){\n\
-			current_successes += tyche_i_uint(state) % 4 == 0;\n\
+			current_successes += roll(&num_sims_left, &sims, &state) == true;\n\
 		}\n\
 		if(most_successes < current_successes){\n\
 			most_successes = current_successes;\n\
 		}\n\
 	}\n\
 	res[gid] = most_successes;\n\
+}\n\
+bool roll(int *num_sims_left, ulong *sims, tyche_i_state *state){\n\
+	bool success = false;\n\
+	if(*num_sims_left <= 0){\n\
+		*sims = make_more_sims(state);\n\
+		*num_sims_left = SIMS_PER_LONG;\n\
+	}\n\
+	*num_sims_left -= 1;\n\
+	success = (*sims & FIRST_SIM) == 1;\n\
+	*sims >>= 2;\n\
+	return success;\n\
+}\n\
+ulong make_more_sims(tyche_i_state *state){\n\
+	ulong sims = tyche_i_ulong((*state));\n\
+	ulong even_bits = sims & EVEN_BITS;\n\
+	ulong odd_bits = sims & ~ EVEN_BITS;\n\
+	even_bits >>= 1;\n\
+	sims = even_bits & odd_bits;\n\
+	return sims;\n\
 }\n"
 };
-
-#ifdef _WIN32
-#define COMPILER_OPTS "-I ..\\generators\\"
-#else
-#define COMPILER_OPTS "-I ../generators/"
-#endif
-
-#define KERNEL_NAME "simulate"
-#define CL_PLATFORM_NOT_FOUND_KHR -1001
-#define FIRST_PLATFORM 0
-#define FIRST_DEVICE 0
-#define MAX_MEMORY_USAGE (long) 4 * 1024 * 1024 * 1024
-
-#define SIMS_TOO_BIG -1
-#define TOO_MUCH_MEMORY -2
-#define OK 1
-#define TOO_WEIRD -12345
 
 int main(int argc, char ** argv){
 	size_t param_max_size;
